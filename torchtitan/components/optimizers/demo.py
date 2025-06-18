@@ -244,7 +244,7 @@ def demo(
                 weight.add_(decoded, alpha=last_lr)
                 
         # Perform delayed feedback
-        if compressed_buffer_list[i] is not None:
+        if overlapped and nesterov and compressed_buffer_list[i] is not None:
             cd, cm = compressed_buffer_list[i]
             momentum_buffer_list[i].add_(collective._decompress(cd, **cm), alpha=-feedback_strength)
         

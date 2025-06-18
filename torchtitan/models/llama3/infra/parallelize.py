@@ -95,6 +95,7 @@ def parallelize_llama(
             pp_enabled=parallel_dims.pp_enabled,
             cpu_offload=job_config.training.enable_cpu_offload,
             reshard_after_forward_policy=job_config.parallelism.fsdp_reshard_after_forward,
+            disable_all_reduce=job_config.parallelism.force_disable_gradient_all_reduce,
         )
 
         if parallel_dims.dp_replicate_enabled:
@@ -115,6 +116,7 @@ def parallelize_llama(
             world_mesh,
             enable_compile=job_config.training.compile,
             enable_compiled_autograd=job_config.parallelism.enable_compiled_autograd,
+            disable_all_reduce=job_config.parallelism.force_disable_gradient_all_reduce,
         )
 
     return model
@@ -318,6 +320,7 @@ def apply_fsdp(
     pp_enabled: bool,
     cpu_offload: bool = False,
     reshard_after_forward_policy: str = "default",
+    disable_all_reduce: bool = False,
 ):
     """
     Apply data parallelism (via FSDP2) to the model.
@@ -365,13 +368,22 @@ def apply_fsdp(
             reshard_after_forward=reshard_after_forward,
         )
     fully_shard(model, **fsdp_config, reshard_after_forward=not pp_enabled)
+    if disable_all_reduce:
+        model.set_requires_all_reduce(False, recurse=True)
 
+
+def ddp_noop_hook(_, bucket) -> torch.futures.Future[torch.Tensor]:
+    fut: torch.futures.Future[torch.Tensor] = torch.futures.Future()
+    fut.set_result(bucket.buffer())
+
+    return fut
 
 def apply_ddp(
     model: nn.Module,
     dp_mesh: DeviceMesh,
     enable_compile: bool,
     enable_compiled_autograd: bool,
+    disable_all_reduce: bool = False,
 ):
     if enable_compile:
         if enable_compiled_autograd:
@@ -382,5 +394,8 @@ def apply_ddp(
             torch._dynamo.config.optimize_ddp = "ddp_optimizer"
 
     replicate(model, device_mesh=dp_mesh, bucket_cap_mb=100)
+    
+    if disable_all_reduce:
+        model.register_comm_hook(None, ddp_noop_hook)
 
     logger.info("Applied DDP to the model")

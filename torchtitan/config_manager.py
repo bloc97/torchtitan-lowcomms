@@ -128,13 +128,28 @@ class Optimizer:
 
     beta1: float = 0.9
     beta2: float = 0.95
-    """Exponential moving average hyperparameters to use"""
+    """Exponential moving average hyperparameters to use, for Adam"""
 
     eps: float = 1e-8
-    """Epsilon value to use"""
+    """Epsilon value to use, for Adam"""
 
     weight_decay: float = 0.1
     """Weight decay to use"""
+    
+    momentum: float = 0.99
+    """Momentum value to use, for DeMo"""
+    
+    compression_ratio: float = 0.01
+    """Low-communications compression ratio to use, proportional to bandwidth reduction, for DeMo"""
+    
+    feedback_strength: float = 0.2
+    """Feedback strength value to use, for DeMo"""
+    
+    nesterov: bool = False
+    """Local nesterov lookahead, for DeMo"""
+    
+    overlapped: bool = False
+    """Overlapped communications, for DeMo"""
 
     implementation: Literal["for-loop", "foreach", "fused"] = "fused"
     """
@@ -216,6 +231,11 @@ class Training:
     enable_cpu_offload: bool = False
     """
     Whether to apply CPU offloading of parameters, gradients, and optimizer states in FSDP
+    """
+
+    force_default_precision: Literal["bfloat16", "float32"] | None = None
+    """
+    Force default torch dtype
     """
 
     mixed_precision_param: Literal["bfloat16", "float32"] = "bfloat16"
@@ -362,6 +382,9 @@ class Parallelism:
     - 'alltoall' means to all-to-all shuffle the kv shards.
     The default value is 'allgather'.
     """
+
+    force_disable_gradient_all_reduce: bool = False
+    """Force disable dp_shard gradient native all-reduce. Enable when using low-communications optimizers' custom collectives or for debugging purposes."""
 
 
 @dataclass

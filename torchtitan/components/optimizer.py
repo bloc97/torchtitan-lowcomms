@@ -14,11 +14,17 @@ from torch.distributed.checkpoint.state_dict import (
     set_optimizer_state_dict,
     StateDictOptions,
 )
+import torch.distributed.fsdp
+from torch.distributed import DeviceMesh
 from torch.distributed.checkpoint.stateful import Stateful
+from torchtitan.distributed.overrides import foreach_reduce_custom
 from torch.optim import Optimizer
 
 from torchtitan.components.ft import FTManager, has_torchft
 from torchtitan.config_manager import JobConfig
+from torchtitan.tools.logging import logger
+
+from .optimizers.demo import DeMo, DCTTopKCollective
 
 __all__ = [
     "OptimizersContainer",
@@ -242,6 +248,7 @@ def build_optimizers(
     model_parts: list[nn.Module],
     job_config: JobConfig,
     ft_manager: FTManager,
+    world_mesh: DeviceMesh,
 ) -> OptimizersContainer:
     """Create a OptimizersContainer for the given model parts and job config.
 
@@ -266,30 +273,53 @@ def build_optimizers(
             "Optimizers in backward is not supported with pipeline parallelism."
         )
     name = job_config.optimizer.name
-    lr = job_config.optimizer.lr
-    beta1 = job_config.optimizer.beta1
-    beta2 = job_config.optimizer.beta2
-    eps = job_config.optimizer.eps
-    weight_decay = job_config.optimizer.weight_decay
+    opt_config = job_config.optimizer
+    
 
-    optim_implementation = job_config.optimizer.implementation
+    optim_implementation = opt_config.implementation
     assert optim_implementation in ["fused", "foreach", "for-loop"]
 
     fused = optim_implementation == "fused"
     foreach = optim_implementation == "foreach"
 
     optimizer_kwargs = {
-        "lr": lr,
-        "betas": (beta1, beta2),
-        "eps": eps,
-        "weight_decay": weight_decay,
+        "lr": opt_config.lr,
+        "betas": (opt_config.beta1, opt_config.beta2),
+        "eps": opt_config.eps,
+        "weight_decay": opt_config.weight_decay,
         "fused": fused,
         "foreach": foreach,
     }
 
+    if name == "DeMo":
+        disable_all_reduce = job_config.parallelism.force_disable_gradient_all_reduce
+        demo_dp_group = None
+        
+        if disable_all_reduce:
+            # Override HSDP all-reduce code
+            torch.distributed.fsdp._fully_shard._fsdp_collectives.foreach_reduce = foreach_reduce_custom
+            torch.distributed.fsdp._fully_shard._fsdp_param_group.foreach_reduce = foreach_reduce_custom
+            
+            # Initialize custom dp_replicate collective group
+            demo_dp_group = world_mesh["dp_replicate"].get_group()
+        else:
+            logger.warning(f"The DeMo optimizer is being without enabling the disable_all_reduce flag. The original DDP/HSDP all-reduce be used, and the custom DeMo all-gather collective will be disabled. This will disable compression across the dp_replicate world group, and is not the intended use case for low-communications training!")
+        
+        optimizer_kwargs = {
+            "lr": opt_config.lr,
+            "momentum": opt_config.momentum,
+            "compression_ratio": opt_config.compression_ratio,
+            "feedback_strength": opt_config.feedback_strength,
+            "weight_decay": opt_config.weight_decay,
+            "nesterov": opt_config.nesterov,
+            "overlapped": opt_config.overlapped,
+            "collective": DCTTopKCollective(dp_replicate_group=demo_dp_group),
+        }
+        
     optimizer_classes = {
         "Adam": torch.optim.Adam,
         "AdamW": torch.optim.AdamW,
+        "DeMo": DeMo,
     }
     if name not in optimizer_classes:
         raise NotImplementedError(f"Optimizer {name} not added.")

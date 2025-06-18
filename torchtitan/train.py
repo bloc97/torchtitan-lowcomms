@@ -22,7 +22,7 @@ from torchtitan.components.metrics import (
     build_metrics_processor,
     ensure_pp_loss_visible,
 )
-from torchtitan.config_manager import ConfigManager, JobConfig
+from torchtitan.config_manager import ConfigManager, JobConfig, TORCH_DTYPE_MAP
 from torchtitan.distributed import ParallelDims, utils as dist_utils
 from torchtitan.protocols.model_converter import build_model_converters
 from torchtitan.tools import utils
@@ -280,7 +280,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         # build optimizer after applying parallelisms to the model
         self.optimizers = self.train_spec.build_optimizers_fn(
-            self.model_parts, job_config, self.ft_manager
+            self.model_parts, job_config, self.ft_manager, self.world_mesh
         )
         self.lr_schedulers = self.train_spec.build_lr_schedulers_fn(
             self.optimizers, job_config
@@ -450,6 +450,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         if parallel_dims.dp_cp_enabled or self.ft_manager.enabled:
             loss = loss.detach()
+            total_norm = total_norm.detach()
             # Skip ft manager communication when using semi sync training
             use_ft_pg = (
                 self.ft_manager.enabled
@@ -460,10 +461,25 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 dist_utils.dist_mean(loss, self.world_mesh["dp_cp"], ft_pg),
                 dist_utils.dist_max(loss, self.world_mesh["dp_cp"], ft_pg),
             )
+            total_norm = dist_utils.dist_mean(total_norm.to(loss.device), self.world_mesh["dp_cp"], ft_pg)
         else:
             global_avg_loss = global_max_loss = loss.detach().item()
+            total_norm = total_norm.detach().item()
 
-        self.metrics_processor.log(self.step, global_avg_loss, global_max_loss)
+        # extra metrics for optimizer
+        extra_metrics = {
+            "optimizer_metrics/total_norm": total_norm,
+        }
+
+        # log learning rates
+        current_learning_rates = self.lr_schedulers.schedulers[0].get_last_lr() #All schedulers in lr_schedulers have same lr (see LRSchedulersContainer)
+        if len(current_learning_rates) == 1:
+            extra_metrics["optimizer_metrics/learning_rate"] = current_learning_rates[0]
+        else:
+            for li, learning_rate in enumerate(current_learning_rates):
+                extra_metrics[f"optimizer_metrics/learning_rate_{li}"] = learning_rate
+
+        self.metrics_processor.log(self.step, global_avg_loss, global_max_loss, extra_metrics)
 
     @record
     def train(self):
@@ -536,6 +552,9 @@ if __name__ == "__main__":
     config_manager = ConfigManager()
     config = config_manager.parse_args()
     trainer: Optional[Trainer] = None
+    
+    if config.training.force_default_precision is not None:
+        torch.set_default_dtype(TORCH_DTYPE_MAP[config.training.force_default_precision])
 
     try:
         trainer = Trainer(config)

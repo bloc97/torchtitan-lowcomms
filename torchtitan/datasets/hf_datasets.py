@@ -39,13 +39,23 @@ class DatasetConfig:
 
 # Add your dataset here here - more information at docs/datasets.md
 DATASETS = {
-    "c4": DatasetConfig(
-        path="allenai/c4",
+    # "c4": DatasetConfig(
+    #     path="allenai/c4",
+    #     loader=_load_c4_dataset,
+    #     text_processor=_process_c4_text,
+    # ),
+    "c4_local": DatasetConfig(
+        path="/data/bloc/torchtitan-datasets/c4",
         loader=_load_c4_dataset,
         text_processor=_process_c4_text,
     ),
     "c4_test": DatasetConfig(
         path="tests/assets/c4_test",
+        loader=lambda path: load_dataset(path, split="train"),
+        text_processor=_process_c4_text,
+    ),
+    "c4_deepseek_test": DatasetConfig(
+        path="../../../tests/assets/c4_test",
         loader=lambda path: load_dataset(path, split="train"),
         text_processor=_process_c4_text,
     ),

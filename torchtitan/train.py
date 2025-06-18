@@ -298,6 +298,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         # Initialize trainer states that will be saved in checkpoint.
         # These attributes must be initialized before checkpoint loading.
         self.step = 0
+        self.trained_tokens = 0
 
         self.checkpointer = CheckpointManager(
             dataloader=self.dataloader,
@@ -393,6 +394,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                     self.pp_schedule.step(
                         target=targets, losses=losses, input_batch=inputs
                     )
+                number_of_tokens = targets.numel() # TODO: Verify this is correct under context parallel
 
             # accumulate losses across pipeline microbatches
             # TODO: PP+FSDP unexpectedly puts the loss back to the CPU
@@ -408,11 +410,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 with self.maybe_enable_amp:
                     pred = model_parts[0](inputs)
                     loss = self.loss_fn(pred, labels)
+                    number_of_tokens = labels.numel() # TODO: Verify this is correct under context parallel
                 # need to free to before bwd to avoid peaking memory
                 del pred
                 loss.backward()
 
-        return loss
+        return loss, number_of_tokens
 
     def train_step(
         self, data_iterator: Iterable[tuple[dict[str, torch.Tensor], torch.Tensor]]
@@ -424,11 +427,13 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         parallel_dims = self.parallel_dims
 
         accumulated_losses = []
+        batch_tokens = 0
         # If data runs out during gradient accumulation, that
         # entire step will not be executed.
         for microbatch in range(self.gradient_accumulation_steps):
             input_dict, labels = next(data_iterator)
-            loss = self.forward_backward_step(input_dict, labels)
+            loss, microbatch_tokens = self.forward_backward_step(input_dict, labels)
+            batch_tokens += microbatch_tokens # Accumulate total trained tokens
             accumulated_losses.append(loss.detach())
 
         total_norm = dist_utils.clip_grad_norm_(
@@ -448,7 +453,22 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         if not self.metrics_processor.should_log(self.step):
             return
 
-        if parallel_dims.dp_cp_enabled or self.ft_manager.enabled:
+        local_loss = loss.detach().item()
+        local_total_norm = total_norm.detach().item()
+        
+        if (parallel_dims.dp_enabled or self.ft_manager.enabled):
+            # Skip ft manager communication when using semi sync training
+            use_ft_pg = (
+                self.ft_manager.enabled
+                and self.job_config.fault_tolerance.semi_sync_method is None
+            )
+            ft_pg = self.ft_manager.replicate_pg if use_ft_pg else None
+            global_batch_tokens = dist_utils.dist_sum(torch.tensor(batch_tokens, dtype=torch.int64, device=loss.device), self.world_mesh["dp"], ft_pg)
+        else:
+            global_batch_tokens = batch_tokens
+        self.trained_tokens += global_batch_tokens
+        
+        if (parallel_dims.dp_cp_enabled or self.ft_manager.enabled):
             loss = loss.detach()
             total_norm = total_norm.detach()
             # Skip ft manager communication when using semi sync training
@@ -457,18 +477,24 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 and self.job_config.fault_tolerance.semi_sync_method is None
             )
             ft_pg = self.ft_manager.replicate_pg if use_ft_pg else None
-            global_avg_loss, global_max_loss = (
-                dist_utils.dist_mean(loss, self.world_mesh["dp_cp"], ft_pg),
-                dist_utils.dist_max(loss, self.world_mesh["dp_cp"], ft_pg),
-            )
-            total_norm = dist_utils.dist_mean(total_norm.to(loss.device), self.world_mesh["dp_cp"], ft_pg)
+            global_avg_loss = dist_utils.dist_mean(loss, self.world_mesh["dp_cp"], ft_pg)
+            global_max_loss = dist_utils.dist_max(loss, self.world_mesh["dp_cp"], ft_pg)
+            
+            global_avg_total_norm = dist_utils.dist_mean(total_norm.to(loss.device), self.world_mesh["dp_cp"], ft_pg)
+            global_max_total_norm = dist_utils.dist_max(total_norm.to(loss.device), self.world_mesh["dp_cp"], ft_pg)
         else:
             global_avg_loss = global_max_loss = loss.detach().item()
-            total_norm = total_norm.detach().item()
+            global_avg_total_norm = global_max_total_norm = total_norm.detach().item()
 
         # extra metrics for optimizer
         extra_metrics = {
-            "optimizer_metrics/total_norm": total_norm,
+            "loss_metrics/local_loss": local_loss,
+            "optimizer_metrics/local_total_norm": local_total_norm,
+            "optimizer_metrics/global_avg_total_norm": global_avg_total_norm,
+            "optimizer_metrics/global_max_total_norm": global_max_total_norm,
+            "data_metrics/local_batch_tokens": batch_tokens,
+            "data_metrics/global_batch_tokens": global_batch_tokens,
+            "data_metrics/total_trained_tokens": self.trained_tokens,
         }
 
         # log learning rates
@@ -537,10 +563,14 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         logger.info("Training completed")
 
     def state_dict(self) -> dict[str, Any]:
-        return {"step": self.step}
+        return {
+            "step": self.step,
+            "trained_tokens": self.trained_tokens,
+            }
 
     def load_state_dict(self, state_dict: dict[str, Any]):
         self.step = state_dict["step"]
+        self.trained_tokens = state_dict["trained_tokens"]
 
     def close(self) -> None:
         if self.checkpointer:

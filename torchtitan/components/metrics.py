@@ -133,7 +133,7 @@ class TensorBoardLogger(BaseLogger):
 class WandBLogger(BaseLogger):
     """Logger implementation for Weights & Biases."""
 
-    def __init__(self, log_dir: str, job_config: JobConfig, tag: str | None = None):
+    def __init__(self, log_dir: str, job_config: JobConfig, tag: str | None = None, current_rank = None):
         # Import wandb here to avoid startup import
         import wandb
 
@@ -142,9 +142,16 @@ class WandBLogger(BaseLogger):
 
         # Create logging directory
         os.makedirs(log_dir, exist_ok=True)
-
+        
+        project_id = os.getenv("WANDB_PROJECT", "torchtitan")
+        group_id = os.getenv("WANDB_GROUP_ID", None)
+        
+        if current_rank is not None and group_id is None:
+            logger.warning(f"WandB multi-rank logging should have a unique group environment variable WANDB_GROUP_ID set!")
+            
         self.wandb.init(
-            project=os.getenv("WANDB_PROJECT", "torchtitan"),
+            project=project_id,
+            group=group_id,
             dir=log_dir,
             config=job_config.to_dict(),
         )
@@ -270,7 +277,7 @@ def _build_metric_logger(
     if metrics_config.enable_wandb:
         logger.debug("Attempting to create WandB logger")
         try:
-            return WandBLogger(base_log_dir, job_config, tag)
+            return WandBLogger(base_log_dir, job_config, tag, torch.distributed.get_rank() if metrics_config.save_for_all_ranks else None)
         except Exception as e:
             if "No module named 'wandb'" in str(e):
                 logger.error(
@@ -389,6 +396,7 @@ class MetricsProcessor:
             "memory/max_reserved(%)": device_mem_stats.max_reserved_pct,
             "memory/num_alloc_retries": device_mem_stats.num_alloc_retries,
             "memory/num_ooms": device_mem_stats.num_ooms,
+            "trainer_metrics/step": step,
         }
 
         if extra_metrics:

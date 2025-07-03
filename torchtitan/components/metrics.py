@@ -357,8 +357,7 @@ class MetricsProcessor:
     def log(
         self,
         step: int,
-        global_avg_loss: float,
-        global_max_loss: float,
+        loss: float,
         grad_norm: float,
         extra_metrics: dict[str, Any] | None = None,
     ):
@@ -383,9 +382,6 @@ class MetricsProcessor:
         device_mem_stats = self.device_memory_monitor.get_peak_stats()
 
         metrics = {
-            "loss_metrics/global_avg_loss": global_avg_loss,
-            "loss_metrics/global_max_loss": global_max_loss,
-            "grad_norm": grad_norm,
             "throughput(tps)": tps,
             "tflops": tflops,
             "mfu(%)": mfu,
@@ -409,7 +405,7 @@ class MetricsProcessor:
         color = self.color
         logger.info(
             f"{color.red}step: {step:2}  "
-            f"{color.green}loss: {global_avg_loss:7.4f}  "
+            f"{color.green}loss: {loss:7.4f}  "
             f"{color.orange}grad_norm: {grad_norm:7.4f}  "
             f"{color.yellow}memory: {device_mem_stats.max_reserved_gib:5.2f}GiB"
             f"({device_mem_stats.max_reserved_pct:.2f}%)  "

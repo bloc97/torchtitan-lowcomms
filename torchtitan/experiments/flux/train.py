@@ -221,14 +221,15 @@ if __name__ == "__main__":
             assert (
                 config.checkpoint.enable_checkpoint
             ), "Must enable checkpointing when creating a seed checkpoint."
-            trainer.checkpointer.save(curr_step=0, force=True)
+            trainer.checkpointer.save(curr_step=0, last_step=True)
             logger.info("Created seed checkpoint")
         else:
             trainer.train()
-    finally:
+    except Exception:
         if trainer:
             trainer.close()
-
-        if torch.distributed.is_initialized():
-            torch.distributed.destroy_process_group()
-            logger.info("Process group destroyed.")
+        raise
+    else:
+        trainer.close()
+        torch.distributed.destroy_process_group()
+        logger.info("Process group destroyed.")

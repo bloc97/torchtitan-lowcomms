@@ -436,7 +436,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             batch_tokens += microbatch_tokens # Accumulate total trained tokens
             accumulated_losses.append(loss.detach())
 
-        total_norm = dist_utils.clip_grad_norm_(
+        total_grad_norm = dist_utils.clip_grad_norm_(
             [p for m in self.model_parts for p in m.parameters()],
             self.job_config.training.max_norm,
             foreach=True,
@@ -454,7 +454,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             return
 
         local_loss = loss.detach().item()
-        local_total_norm = total_norm.detach().item()
+        local_total_grad_norm = total_grad_norm.detach().item()
         
         if (parallel_dims.dp_enabled or self.ft_manager.enabled):
             # Skip ft manager communication when using semi sync training
@@ -470,7 +470,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         
         if (parallel_dims.dp_cp_enabled or self.ft_manager.enabled):
             loss = loss.detach()
-            total_norm = total_norm.detach()
+            total_grad_norm = total_grad_norm.detach()
             # Skip ft manager communication when using semi sync training
             use_ft_pg = (
                 self.ft_manager.enabled
@@ -480,18 +480,20 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             global_avg_loss = dist_utils.dist_mean(loss, self.world_mesh["dp_cp"], ft_pg)
             global_max_loss = dist_utils.dist_max(loss, self.world_mesh["dp_cp"], ft_pg)
             
-            global_avg_total_norm = dist_utils.dist_mean(total_norm.to(loss.device), self.world_mesh["dp_cp"], ft_pg)
-            global_max_total_norm = dist_utils.dist_max(total_norm.to(loss.device), self.world_mesh["dp_cp"], ft_pg)
+            global_avg_total_grad_norm = dist_utils.dist_mean(total_grad_norm.to(loss.device), self.world_mesh["dp_cp"], ft_pg)
+            global_max_total_grad_norm = dist_utils.dist_max(total_grad_norm.to(loss.device), self.world_mesh["dp_cp"], ft_pg)
         else:
             global_avg_loss = global_max_loss = loss.detach().item()
-            global_avg_total_norm = global_max_total_norm = total_norm.detach().item()
+            global_avg_total_grad_norm = global_max_total_grad_norm = total_grad_norm.detach().item()
 
         # extra metrics for optimizer
         extra_metrics = {
             "loss_metrics/local_loss": local_loss,
-            "optimizer_metrics/local_total_norm": local_total_norm,
-            "optimizer_metrics/global_avg_total_norm": global_avg_total_norm,
-            "optimizer_metrics/global_max_total_norm": global_max_total_norm,
+            "loss_metrics/global_avg_loss": global_avg_loss,
+            "loss_metrics/global_max_loss": global_max_loss,
+            "optimizer_metrics/local_total_grad_norm": local_total_grad_norm,
+            "optimizer_metrics/global_avg_total_grad_norm": global_avg_total_grad_norm,
+            "optimizer_metrics/global_max_total_grad_norm": global_max_total_grad_norm,
             "data_metrics/local_batch_tokens": batch_tokens,
             "data_metrics/global_batch_tokens": global_batch_tokens,
             "data_metrics/total_trained_tokens": self.trained_tokens,
@@ -505,7 +507,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             for li, learning_rate in enumerate(current_learning_rates):
                 extra_metrics[f"optimizer_metrics/learning_rate_{li}"] = learning_rate
 
-        self.metrics_processor.log(self.step, global_avg_loss, global_max_loss, extra_metrics)
+        self.metrics_processor.log(
+            self.step,
+            local_loss,
+            local_total_grad_norm,
+            extra_metrics
+        )
 
     @record
     def train(self):
@@ -536,7 +543,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                     logger.warning("Ran out of data; last step was canceled.")
                     break
                 self.checkpointer.save(
-                    self.step, force=(self.step == job_config.training.steps)
+                    self.step, last_step=(self.step == job_config.training.steps)
                 )
 
                 # signal the profiler that the next profiling step has started
@@ -600,14 +607,15 @@ if __name__ == "__main__":
             assert (
                 config.checkpoint.enable_checkpoint
             ), "Must enable checkpointing when creating a seed checkpoint."
-            trainer.checkpointer.save(curr_step=0, force=True)
+            trainer.checkpointer.save(curr_step=0, last_step=True)
             logger.info("Created seed checkpoint")
         else:
             trainer.train()
-    finally:
+    except Exception:
         if trainer:
             trainer.close()
-
-        if torch.distributed.is_initialized():
-            torch.distributed.destroy_process_group()
-            logger.info("Process group destroyed.")
+        raise
+    else:
+        trainer.close()
+        torch.distributed.destroy_process_group()
+        logger.info("Process group destroyed.")

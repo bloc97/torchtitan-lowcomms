@@ -430,13 +430,13 @@ class Checkpoint:
     interval: int = 500
     """Checkpointing interval in steps."""
 
-    last_save_model_weights_only: bool = False
+    last_save_model_weights_only: bool = True
     """
     When last_save_model_weights_only=True, only model weights will be saved at the end of training,
     the last save.  With this, checkpoints can be loaded using `torch.load(..., weights_only=True)`
     after conversion.  When last_save_model_weights_only=False, the full checkpoint will be saved.
     A full checkpoint includes model, optimizer and train_state, which can be used to resume training.
-    The default value is false.
+    The default value is True.
     """
 
     export_dtype: Literal["float16", "bfloat16", "float32"] = "float32"
@@ -537,6 +537,13 @@ class Float8:
     If True, emulation is used instead of hardware accelerated gemm. This is for test purpose only,
     as the current CI does not have sm_89 capability, required by Float8.
     Not compatible with torch.compile.
+    """
+
+    moe_fqns_prototype: list[str] | str = field(default_factory=list)
+    """
+    Comma-separated list of fully qualified names of MoE modules to apply float8 rowwise training to.
+    This is a prototype feature that requires the torchao nightly build.
+    Example: --float8.moe_fqns_prototype="experts"
     """
 
 

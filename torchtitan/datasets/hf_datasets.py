@@ -45,7 +45,7 @@ DATASETS = {
     #     text_processor=_process_c4_text,
     # ),
     "c4_local": DatasetConfig(
-        path="/data/bloc/torchtitan-datasets/c4",
+        path="/home/bloc/c4",
         loader=_load_c4_dataset,
         text_processor=_process_c4_text,
     ),

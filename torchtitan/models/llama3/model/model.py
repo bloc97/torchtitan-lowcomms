@@ -7,6 +7,8 @@
 # Copyright (c) Meta Platforms, Inc. All Rights Reserved.
 
 
+import math
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -387,6 +389,8 @@ class Transformer(nn.Module, ModelProtocol):
                 a=-cutoff_factor * final_out_std,
                 b=cutoff_factor * final_out_std,
             )
+            
+        initialize_llama_weights(self, self.model_args)
 
     def _precompute_freqs_cis(self) -> torch.Tensor:
         return precompute_freqs_cis(
@@ -430,3 +434,48 @@ class Transformer(nn.Module, ModelProtocol):
         h = self.norm(h) if self.norm else h
         output = self.output(h) if self.output else h
         return output
+
+def _init_normal(module, std: float, cutoff_factor: float = 3.0):
+    with torch.no_grad():
+        cutoff = std * cutoff_factor
+        weight = module.weight
+        weight.normal_(0, std)
+        torch.clamp_(weight, min=-cutoff, max=cutoff)
+        if hasattr(module, "bias") and module.bias is not None:
+            module.bias.zero_()
+
+def initialize_llama_weights(model, config):
+    """Initialize model weights using the "Mitchell" initialization scheme"""
+
+    wte_std = 1 / math.sqrt(config.dim)
+    _init_normal(model.tok_embeddings, std=wte_std)
+
+    for _, layer_id_str in enumerate(model.layers):
+        layer_id = int(layer_id_str)
+        layer = model.layers[layer_id_str]
+
+        attn_std = 1 / math.sqrt(config.dim)
+        _init_normal(layer.attention.wq, std=attn_std)
+        _init_normal(layer.attention.wk, std=attn_std)
+        _init_normal(layer.attention.wv, std=attn_std)
+
+        attn_out_std = 1 / (math.sqrt(2 * config.dim * (layer_id + 1)))
+        _init_normal(layer.attention.wo, std=attn_out_std)
+
+        ff_std = 1 / math.sqrt(config.dim)
+        _init_normal(layer.feed_forward.w1, std=ff_std)
+        _init_normal(layer.feed_forward.w3, std=ff_std)
+
+        ff_out_std = 1 / (
+            math.sqrt(2 * layer.feed_forward.w2.in_features * (layer_id + 1))
+        )
+        _init_normal(layer.feed_forward.w2, std=ff_out_std)
+
+        nn.init.ones_(layer.attention_norm.weight)
+        nn.init.ones_(layer.ffn_norm.weight)
+
+    nn.init.ones_(model.norm.weight)
+
+    if model.output is not None:
+        lm_std = 1 / math.sqrt(config.dim)
+        _init_normal(model.output, std=lm_std)

@@ -583,6 +583,10 @@ if __name__ == "__main__":
     config = config_manager.parse_args()
     trainer: Optional[Trainer] = None
     
+    if config.training.vram_fraction is not None:
+        for g in range(torch.cuda.device_count()):
+            torch.cuda.set_per_process_memory_fraction(config.training.vram_fraction, device=g)
+    
     if config.training.force_default_precision is not None:
         torch.set_default_dtype(TORCH_DTYPE_MAP[config.training.force_default_precision])
 

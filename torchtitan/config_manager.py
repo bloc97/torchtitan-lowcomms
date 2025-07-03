@@ -271,6 +271,9 @@ class Training:
 
     deterministic: bool = False
     """Use deterministic algorithms wherever possible, may be slower"""
+    
+    vram_fraction: float | None = None
+    """Force limit available VRAM to simulate constrained GPU conditions"""
 
 
 @dataclass

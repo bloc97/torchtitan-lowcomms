@@ -17,7 +17,7 @@ from torch.distributed.checkpoint.state_dict import (
 import torch.distributed.fsdp
 from torch.distributed import DeviceMesh
 from torch.distributed.checkpoint.stateful import Stateful
-from torchtitan.distributed.overrides import foreach_reduce_custom
+from torchtitan.distributed.overrides import foreach_reduce
 from torch.optim import Optimizer
 
 from torchtitan.components.ft import FTManager, has_torchft
@@ -291,19 +291,20 @@ def build_optimizers(
         "foreach": foreach,
     }
 
+    disable_all_reduce = job_config.parallelism.force_disable_gradient_all_reduce
+    if disable_all_reduce:
+        # Override HSDP all-reduce code
+        torch.distributed.fsdp._fully_shard._fsdp_collectives.foreach_reduce = foreach_reduce
+        torch.distributed.fsdp._fully_shard._fsdp_param_group.foreach_reduce = foreach_reduce
+        
     if name == "DeMo":
-        disable_all_reduce = job_config.parallelism.force_disable_gradient_all_reduce
         demo_dp_group = None
         
         if disable_all_reduce:
-            # Override HSDP all-reduce code
-            torch.distributed.fsdp._fully_shard._fsdp_collectives.foreach_reduce = foreach_reduce_custom
-            torch.distributed.fsdp._fully_shard._fsdp_param_group.foreach_reduce = foreach_reduce_custom
-            
             # Initialize custom dp_replicate collective group
             demo_dp_group = world_mesh["dp_replicate"].get_group()
         else:
-            logger.warning(f"The DeMo optimizer is being without enabling the disable_all_reduce flag. The original DDP/HSDP all-reduce be used, and the custom DeMo all-gather collective will be disabled. This will disable compression across the dp_replicate world group, and is not the intended use case for low-communications training!")
+            logger.warning(f"The DeMo optimizer is being used without enabling the disable_all_reduce flag. The original DDP/HSDP all-reduce be used, and the custom DeMo all-gather collective will be disabled. This will disable compression across the dp_replicate world group, and is not the intended use case for low-communications training!")
         
         optimizer_kwargs = {
             "lr": opt_config.lr,
@@ -315,6 +316,9 @@ def build_optimizers(
             "overlapped": opt_config.overlapped,
             "collective": DCTTopKCollective(dp_replicate_group=demo_dp_group),
         }
+    else:
+        if disable_all_reduce:
+            logger.warning(f"A standard optimizer is being used with the disable_all_reduce flag. Gradients will not be synchronized across replicated shards! This is only recommended for debug purposes.")
         
     optimizer_classes = {
         "Adam": torch.optim.Adam,

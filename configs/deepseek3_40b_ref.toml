@@ -1,10 +1,10 @@
 # torchtitan Config.toml
 
 [job]
-dump_folder = "./outputs"
-description = "Llama 3 debug training"
+dump_folder = "/home/bloc/torchtitan-dumps"
+description = "DeepSeek v3 1b DeMo training hsdp"
 print_args = false
-use_for_integration_test = true
+use_for_integration_test = false
 
 [profiling]
 enable_profiling = false
@@ -18,57 +18,63 @@ log_freq = 1
 disable_color_printing = false
 enable_tensorboard = false
 save_tb_folder = "tb"
-enable_wandb = false
+enable_wandb = true
 
 [model]
-name = "llama3"
-flavor = "test_1b"
+name = "deepseek_v3_dense"
+flavor = "consilience_40b"
 # test tokenizer.model, for debug purpose only
-tokenizer_path = "./tests/assets/test_tiktoken.model"
+tokenizer_path = "./configs/tokenizers/llama3_8b_truncated_32000.model"
 # converters = ["float8"]
 
 [optimizer]
-name = "AdamW"
+name = "DeMo"
 lr = 4e-4
-eps = 1e-6
+overlapped = true
+nesterov = true
+#implementation = "for-loop"
 
 [lr_scheduler]
-warmup_steps = 100  # lr scheduler warm up, normally 20% of the train steps
+warmup_steps = 1000  # lr scheduler warm up, normally 20% of the train steps
 decay_ratio = 0.8  # lr scheduler decay ratio, 80% of the train steps
 decay_type = "cosine"
 lr_min = 0.1
 
 [training]
-local_batch_size = 64
-seq_len = 1024
+local_batch_size = 1
+global_batch_size = 1024
+seq_len = 2048
 max_norm = 1.0  # grad norm clipping
-steps = 10000
+steps = 5000
 compile = true
-dataset = "c4_test"  # supported datasets: c4_test (2K), c4 (177M)
-# force_default_precision = "bfloat16"
-# mixed_precision_param = "bfloat16"
-# mixed_precision_reduce = "bfloat16"
+dataset = "c4_local"  # supported datasets: c4_test (2K), c4 (177M)
+force_default_precision = "bfloat16"
+seed = 42
+mixed_precision_param = "bfloat16"
+mixed_precision_reduce = "bfloat16"
+vram_fraction = 0.44 # Simulate H100 VRAM on B200
 
 [parallelism]
-data_parallel_replicate_degree = 8
-data_parallel_shard_degree = 1
+data_parallel_replicate_degree = 4
+data_parallel_shard_degree = 8
 fsdp_reshard_after_forward = "default" # default / never / always
 tensor_parallel_degree = 1
 enable_async_tensor_parallel = false
 pipeline_parallel_degree = 1
 context_parallel_degree = 1
+force_disable_gradient_all_reduce = true
 
 [checkpoint]
 enable_checkpoint = false
-folder = "checkpoint"
-interval = 10
+folder = "/home/bloc/torchtitan-checkpoints/deepseek-1b-DeMo-hsdp-test-big-tokenizer"
+interval = 1000
 last_save_model_weights_only = false
 # export_dtype = "float32"
 export_dtype = "bfloat16"
 async_mode = "disabled"  # ["disabled", "async", "async_with_pinned_mem"]
 
 [activation_checkpoint]
-mode = "none"  # ["none", "selective", "full"]
+mode = "selective"  # ["none", "selective", "full"]
 selective_ac_option = '2'  # 'int' = ac every positive int layer or 'op', ac based on ops policy
 
 [float8]

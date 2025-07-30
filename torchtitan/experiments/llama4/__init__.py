@@ -6,15 +6,15 @@
 
 from torchtitan.components.loss import build_cross_entropy_loss
 from torchtitan.components.lr_scheduler import build_lr_schedulers
-from torchtitan.components.optimizer import build_optimizers
+from torchtitan.components.tokenizer import build_hf_tokenizer
 from torchtitan.datasets.hf_datasets import build_hf_dataloader
-from torchtitan.datasets.tokenizer.tiktoken import build_tiktoken_tokenizer
 from torchtitan.models.llama3 import pipeline_llama
 from torchtitan.protocols.train_spec import register_train_spec, TrainSpec
 
 from .infra.parallelize import parallelize_llama
 from .model.args import TransformerModelArgs
 from .model.model import Transformer
+from .optimizer import build_llama4_optimizers
 
 __all__ = [
     "TransformerModelArgs",
@@ -28,6 +28,7 @@ llama4_configs = {
         dim=256,
         n_layers=6,
         n_heads=16,
+        vocab_size=2000,
         rope_theta=500000,
     ),
     "17bx16e": TransformerModelArgs(
@@ -38,6 +39,7 @@ llama4_configs = {
         ffn_dim_multiplier=1.2,
         multiple_of=2048,
         rope_theta=500000,
+        max_seq_len=10485760,
         num_experts=16,
         interleave_moe_layer_step=1,
     ),
@@ -55,6 +57,7 @@ llama4_configs = {
         dim=256,
         n_layers=6,
         n_heads=16,
+        vocab_size=2000,
         rope_theta=500000,
         every_n_layers_nope=4,
         fixed_attn_block_size=256,
@@ -69,6 +72,7 @@ llama4_configs = {
         ffn_dim_multiplier=1.2,
         multiple_of=2048,
         rope_theta=500000,
+        max_seq_len=10485760,
         num_experts=16,
         interleave_moe_layer_step=1,
         every_n_layers_nope=4,
@@ -94,14 +98,14 @@ llama4_configs = {
 register_train_spec(
     TrainSpec(
         name="llama4",
-        cls=Transformer,
-        config=llama4_configs,
+        model_cls=Transformer,
+        model_args=llama4_configs,
         parallelize_fn=parallelize_llama,
         pipelining_fn=pipeline_llama,
-        build_optimizers_fn=build_optimizers,
+        build_optimizers_fn=build_llama4_optimizers,
         build_lr_schedulers_fn=build_lr_schedulers,
         build_dataloader_fn=build_hf_dataloader,
-        build_tokenizer_fn=build_tiktoken_tokenizer,
+        build_tokenizer_fn=build_hf_tokenizer,
         build_loss_fn=build_cross_entropy_loss,
     )
 )

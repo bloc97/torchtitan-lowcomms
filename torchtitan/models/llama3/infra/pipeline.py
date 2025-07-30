@@ -8,6 +8,7 @@
 
 import copy
 
+import torch
 import torch.nn as nn
 from torch.distributed import DeviceMesh
 from torch.distributed.pipelining import PipelineStage
@@ -18,14 +19,14 @@ from torch.distributed.pipelining.schedules import (
 )
 
 from torchtitan.components.loss import LossFunction
-from torchtitan.config_manager import JobConfig
+from torchtitan.config import JobConfig
 from torchtitan.distributed import ParallelDims
 from torchtitan.distributed.pipeline import (
     build_pipeline_schedule,
     generate_split_points,
     stage_ids_this_rank,
 )
-from torchtitan.protocols.train_spec import DeviceType, ParallelizeFunction
+from torchtitan.protocols.train_spec import ParallelizeFunction
 from torchtitan.tools.logging import logger
 
 from ..model.args import TransformerModelArgs
@@ -33,18 +34,17 @@ from ..model.args import TransformerModelArgs
 
 def pipeline_llama(
     model: nn.Module,
-    world_mesh: DeviceMesh,
     parallel_dims: ParallelDims,
     job_config: JobConfig,
-    device: DeviceType,
-    model_config: TransformerModelArgs,
+    device: torch.device,
+    model_args: TransformerModelArgs,
     parallelize_fn: ParallelizeFunction,
     loss_fn: LossFunction,
 ) -> tuple[_PipelineSchedule, list[nn.Module], bool, bool]:
-    pp_mesh = world_mesh["pp"]
+    pp_mesh = parallel_dims.world_mesh["pp"]
 
     stages, model_parts = pipeline_llama_manual_split(
-        model, pp_mesh, parallel_dims, job_config, device, model_config
+        model, pp_mesh, parallel_dims, job_config, device, model_args
     )
 
     # For PP with looped schedules, each item in model_parts is one stage-model-chunk.
@@ -52,7 +52,7 @@ def pipeline_llama(
     # optimizer, and checkpointing
     for i, m in enumerate(model_parts):
         # apply SPMD-style PT-D techniques
-        m = parallelize_fn(m, world_mesh, parallel_dims, job_config)
+        m = parallelize_fn(m, parallel_dims, job_config)
         model_parts[i] = m
         # NOTE: this is to update the model in the stage
         #       in case the model is modified e.g. by torch.compile
@@ -77,8 +77,8 @@ def pipeline_llama_manual_split(
     pp_mesh: DeviceMesh,
     parallel_dims: ParallelDims,
     job_config: JobConfig,
-    device: DeviceType,
-    model_config: TransformerModelArgs,
+    device: torch.device,
+    model_args: TransformerModelArgs,
 ) -> tuple[list[PipelineStage], list[nn.Module]]:
     """
     This API extracts one torch.nn.Module objects for the part of the model configured to run inside this stage.
@@ -95,7 +95,7 @@ def pipeline_llama_manual_split(
     splits = parallelism_config.pipeline_parallel_split_points or generate_split_points(
         parallelism_config.pipeline_parallel_schedule,
         parallel_dims.pp,
-        model_config.n_layers,
+        model_args.n_layers,
         parallelism_config.pipeline_parallel_layers_per_stage,
     )
 

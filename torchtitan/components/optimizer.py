@@ -21,7 +21,8 @@ from torchtitan.distributed.overrides import foreach_reduce
 from torch.optim import Optimizer
 
 from torchtitan.components.ft import FTManager, has_torchft
-from torchtitan.config_manager import JobConfig
+from torchtitan.config import Optimizer as OptimizerConfig
+from torchtitan.distributed import ParallelDims
 from torchtitan.tools.logging import logger
 
 from .optimizers.demo import DeMo, DCTTopKCollective
@@ -246,14 +247,16 @@ class FTOptimizersContainer(OptimizersContainer):
 
 def build_optimizers(
     model_parts: list[nn.Module],
-    job_config: JobConfig,
-    ft_manager: FTManager,
+    optimizer_config: OptimizerConfig,
+    parallel_dims: ParallelDims,
+    ft_manager: FTManager | None = None,
     world_mesh: DeviceMesh,
+    force_disable_gradient_all_reduce: bool,
 ) -> OptimizersContainer:
     """Create a OptimizersContainer for the given model parts and job config.
 
     This function creates a ``OptimizersContainer`` for the given model parts.
-    ``job_config`` should define the correct optimizer name and parameters.
+    ``optimizer_config`` should define the correct optimizer name and parameters.
     This function currently supports creating ``OptimizersContainer`` and
     ``OptimizersInBackwardContainer``.
 
@@ -265,33 +268,41 @@ def build_optimizers(
 
     Args:
         model_parts (List[nn.Module]): List of model parts to be optimized.
-        job_config (JobConfig): Job config containing the optimizer name and parameters.
+        optimizer_config (OptimizerConfig): Optimizer config containing the optimizer name and parameters.
+        parallel_dims (ParallelDims): Parallel dimensions for the model.
     """
-    optim_in_bwd = job_config.optimizer.early_step_in_backward
-    if optim_in_bwd and job_config.parallelism.pipeline_parallel_degree > 1:
-        raise NotImplementedError(
-            "Optimizers in backward is not supported with pipeline parallelism."
-        )
-    name = job_config.optimizer.name
-    opt_config = job_config.optimizer
-    
+    optim_in_bwd = optimizer_config.early_step_in_backward
+    if optim_in_bwd:
+        if parallel_dims.ep_enabled:
+            raise NotImplementedError(
+                "Optimizers in backward is not supported with Expert Parallel."
+            )
+        if parallel_dims.pp_enabled:
+            raise NotImplementedError(
+                "Optimizers in backward is not supported with Pipeline Parallel."
+            )
+        if ft_manager and ft_manager.enabled:
+            raise NotImplementedError(
+                "TorchFT is not supported with optimizers in backward."
+            )
 
-    optim_implementation = opt_config.implementation
+    name = optimizer_config.name
+    optim_implementation = optimizer_config.implementation
     assert optim_implementation in ["fused", "foreach", "for-loop"]
 
     fused = optim_implementation == "fused"
     foreach = optim_implementation == "foreach"
 
     optimizer_kwargs = {
-        "lr": opt_config.lr,
-        "betas": (opt_config.beta1, opt_config.beta2),
-        "eps": opt_config.eps,
-        "weight_decay": opt_config.weight_decay,
+        "lr": optimizer_config.lr,
+        "betas": (optimizer_config.beta1, optimizer_config.beta2),
+        "eps": optimizer_config.eps,
+        "weight_decay": optimizer_config.weight_decay,
         "fused": fused,
         "foreach": foreach,
     }
 
-    disable_all_reduce = job_config.parallelism.force_disable_gradient_all_reduce
+    disable_all_reduce = force_disable_gradient_all_reduce
     if disable_all_reduce:
         # Override HSDP all-reduce code
         torch.distributed.fsdp._fully_shard._fsdp_collectives.foreach_reduce = foreach_reduce
@@ -307,13 +318,13 @@ def build_optimizers(
             logger.warning(f"The DeMo optimizer is being used without enabling the disable_all_reduce flag. The original DDP/HSDP all-reduce be used, and the custom DeMo all-gather collective will be disabled. This will disable compression across the dp_replicate world group, and is not the intended use case for low-communications training!")
         
         optimizer_kwargs = {
-            "lr": opt_config.lr,
-            "momentum": opt_config.momentum,
-            "compression_ratio": opt_config.compression_ratio,
-            "feedback_strength": opt_config.feedback_strength,
-            "weight_decay": opt_config.weight_decay,
-            "nesterov": opt_config.nesterov,
-            "overlapped": opt_config.overlapped,
+            "lr": optimizer_config.lr,
+            "momentum": optimizer_config.momentum,
+            "compression_ratio": optimizer_config.compression_ratio,
+            "feedback_strength": optimizer_config.feedback_strength,
+            "weight_decay": optimizer_config.weight_decay,
+            "nesterov": optimizer_config.nesterov,
+            "overlapped": optimizer_config.overlapped,
             "collective": DCTTopKCollective(dp_replicate_group=demo_dp_group),
         }
     else:
@@ -329,19 +340,18 @@ def build_optimizers(
         raise NotImplementedError(f"Optimizer {name} not added.")
     optimizer_cls = optimizer_classes[name]
 
-    if optim_in_bwd and ft_manager.enabled:
-        raise ValueError("TorchFT is not supported with optimizers in backward.")
-    elif optim_in_bwd:
+    if optim_in_bwd:
         return OptimizersInBackwardContainer(
             model_parts, optimizer_cls, optimizer_kwargs
         )
-    elif ft_manager.enabled:
+
+    if ft_manager and ft_manager.enabled:
         return FTOptimizersContainer(
             model_parts,
             optimizer_cls,
             optimizer_kwargs,
             ft_manager.manager,
-            use_ft_optimizer=job_config.fault_tolerance.semi_sync_method is None,
+            use_ft_optimizer=ft_manager.use_async_quorum,
         )
-    else:
-        return OptimizersContainer(model_parts, optimizer_cls, optimizer_kwargs)
+
+    return OptimizersContainer(model_parts, optimizer_cls, optimizer_kwargs)

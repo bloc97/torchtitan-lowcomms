@@ -22,7 +22,7 @@ enable_wandb = false
 name = "llama4"
 flavor = "debugmodel"
 # test tokenizer.model, for debug purpose only
-tokenizer_path = "./tests/assets/test_tiktoken.model"
+tokenizer_path = "./tests/assets/tokenizer"
 # converters = ["float8"]
 
 [optimizer]
@@ -34,7 +34,7 @@ eps = 1e-15
 warmup_steps = 2  # lr scheduler warm up, normally 20% of the train steps
 decay_ratio = 0.8  # lr scheduler decay ratio, 80% of the train steps
 decay_type = "linear"
-lr_min = 0.1
+min_lr_factor = 0.1
 
 [training]
 local_batch_size = 8
@@ -52,12 +52,13 @@ tensor_parallel_degree = 1
 enable_async_tensor_parallel = false
 pipeline_parallel_degree = 1
 context_parallel_degree = 1
+expert_parallel_degree = 1
 
 [checkpoint]
 enable_checkpoint = false
 folder = "checkpoint"
 interval = 10
-last_save_model_weights_only = false
+last_save_model_only = false
 export_dtype = "float32"
 async_mode = "disabled"  # ["disabled", "async", "async_with_pinned_mem"]
 

@@ -58,11 +58,11 @@ def build_test_list():
             [
                 [
                     "--checkpoint.enable_checkpoint",
-                    "--checkpoint.last_save_model_weights_only",
+                    "--checkpoint.last_save_model_only",
                 ],
             ],
-            "Checkpoint Integration Test - Save Model Weights Only fp32",
-            "last_save_model_weights_only_fp32",
+            "Checkpoint Integration Test - Save Model Only fp32",
+            "last_save_model_only_fp32",
         ),
         # Parallelism tests.
         OverrideDefinitions(
@@ -106,7 +106,7 @@ def run_test(test_flavor: OverrideDefinitions, full_path: str, output_dir: str):
     t5_encoder_version_arg = (
         "--encoder.t5_encoder torchtitan/experiments/flux/tests/assets/t5-v1_1-xxl/"
     )
-    tokenzier_path_arg = "--model.tokenizer_path tests/assets/test_tiktoken.model"
+    tokenzier_path_arg = "--model.tokenizer_path tests/assets/tokenizer"
 
     all_ranks = ",".join(map(str, range(test_flavor.ngpu)))
 

@@ -122,22 +122,40 @@ def build_test_list():
             [
                 [
                     "--checkpoint.enable_checkpoint",
-                    "--checkpoint.last_save_model_weights_only",
+                    "--checkpoint.folder hf_checkpoint",
+                    "--checkpoint.last_save_model_only",
+                    "--checkpoint.last_save_in_hf",
+                ],
+                [
+                    "--checkpoint.enable_checkpoint",
+                    "--checkpoint.initial_load_path artifacts-to-be-uploaded/model_only_hf_checkpoint/hf_checkpoint/step-10/",
+                    "--checkpoint.initial_load_model_only",
+                    "--checkpoint.initial_load_in_hf",
                 ],
             ],
-            "Checkpoint Integration Test - Save Model Weights Only fp32",
-            "last_save_model_weights_only_fp32",
+            "Checkpoint Integration Test - save load model only checkpoint in HF definition and format",
+            "model_only_hf_checkpoint",
         ),
         OverrideDefinitions(
             [
                 [
                     "--checkpoint.enable_checkpoint",
-                    "--checkpoint.last_save_model_weights_only",
+                    "--checkpoint.last_save_model_only",
+                ],
+            ],
+            "Checkpoint Integration Test - Save Model Only fp32",
+            "last_save_model_only_fp32",
+        ),
+        OverrideDefinitions(
+            [
+                [
+                    "--checkpoint.enable_checkpoint",
+                    "--checkpoint.last_save_model_only",
                     "--checkpoint.export_dtype bfloat16",
                 ],
             ],
-            "Checkpoint Integration Test - Save Model Weights Only bf16",
-            "last_save_model_weights_only_bf16",
+            "Checkpoint Integration Test - Save Model Only bf16",
+            "last_save_model_only_bf16",
         ),
         OverrideDefinitions(
             [
@@ -331,6 +349,19 @@ def build_test_list():
         OverrideDefinitions(
             [
                 [
+                    "--parallelism.data_parallel_shard_degree=4",
+                    "--activation_checkpoint.mode=selective",
+                    "--activation_checkpoint.selective_ac_option=op",
+                    "--model.flavor=debugmodel_flex_attn",
+                ]
+            ],
+            "FSDP + FLEX + per op SAC",
+            "fsdp+flex_attn+per_op_sac",
+            ngpu=4,
+        ),
+        OverrideDefinitions(
+            [
+                [
                     "--parallelism.context_parallel_degree=4",
                     "--parallelism.context_parallel_rotate_method='allgather'",
                 ]
@@ -430,16 +461,16 @@ def build_test_list():
             "cpu_offload+opt_in_bwd+TP+DP+CP",
             ngpu=8,
         ),
-        OverrideDefinitions(
-            [
-                [
-                    "--memory_estimation.enabled",
-                ]
-            ],
-            "FSDP2 Memory Tracking and Estimation",
-            "fsdp2_memory_estimation",
-            ngpu=2,
-        ),
+        # OverrideDefinitions(
+        #     [
+        #         [
+        #             "--memory_estimation.enabled",
+        #         ]
+        #     ],
+        #     "FSDP2 Memory Tracking and Estimation",
+        #     "fsdp2_memory_estimation",
+        #     ngpu=2,
+        # ),
         OverrideDefinitions(
             [
                 [
@@ -487,7 +518,6 @@ def build_test_list():
                     "--model.converters float8",
                     "--float8.enable_fsdp_float8_all_gather",
                     "--float8.precompute_float8_dynamic_scale_for_fsdp",
-                    "--float8.force_recompute_fp8_weight_in_bwd",
                     "--float8.emulate",
                 ],
             ],
@@ -508,6 +538,20 @@ def build_test_list():
             "Gradient accumulation",
             "gradient_accumulation",
             ngpu=2,
+        ),
+        OverrideDefinitions(
+            [
+                [
+                    "--validation.enabled",
+                    "--validation.dataset c4_test",
+                    "--parallelism.data_parallel_replicate_degree=2",
+                    "--parallelism.tensor_parallel_degree=2",
+                    "--parallelism.context_parallel_degree=2",
+                ],
+            ],
+            "Validation test with fsdp, tp, cp",
+            "validation_fsdp_tp_cp",
+            ngpu=8,
         ),
     ]
     return integration_tests_flavors

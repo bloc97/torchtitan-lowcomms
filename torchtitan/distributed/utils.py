@@ -18,7 +18,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
 from torch.nn.attention import SDPBackend
 
-from torchtitan.config_manager import TORCH_DTYPE_MAP
+from torchtitan.config import Comm as CommConfig, TORCH_DTYPE_MAP
 from torchtitan.distributed.parallel_dims import ParallelDims
 from torchtitan.models.attention import ScaledDotProductAttention
 from torchtitan.tools.logging import logger
@@ -29,7 +29,7 @@ def _dist_reduce(
     x: torch.Tensor,
     reduceOp: str,
     mesh: DeviceMesh,
-    extra_pg: dist.ProcessGroup | None = None,
+    extra_pg: dist.ProcessGroup | None,
 ) -> float:
     """Perform distributed reduction on a tensor.
 
@@ -237,7 +237,9 @@ def maybe_enable_amp(
             )
 
 
-def init_distributed(job_config):
+def init_distributed(
+    comm_config: CommConfig, enable_cpu_backend: bool = False, base_folder: str = ""
+):
     def _warn_overwrite_env(env, val):
         if env in os.environ:
             logger.warning(
@@ -245,13 +247,13 @@ def init_distributed(job_config):
             )
         os.environ[env] = val
 
-    def _get_distributed_backend(job_config):
+    def _get_distributed_backend(enable_cpu_backend):
         backend = "nccl"
         if device_type in torch.distributed.Backend.default_device_backend_map:
             backend = torch.distributed.Backend.default_device_backend_map.get(
                 device_type
             )
-        if job_config.training.enable_cpu_offload:
+        if enable_cpu_backend:
             backend = f"{device_type}:{backend},cpu:gloo"
         return backend
 
@@ -268,17 +270,17 @@ def init_distributed(job_config):
     _warn_overwrite_env(ASYNC_ERROR_HANDLING, SKIP_CLEANUP)
 
     # enable torch nccl flight recorder in the mode that would dump files if timeout is detected
-    _warn_overwrite_env(TRACE_BUFFER_SIZE, str(job_config.comm.trace_buf_size))
-    if job_config.comm.trace_buf_size > 0:
+    _warn_overwrite_env(TRACE_BUFFER_SIZE, str(comm_config.trace_buf_size))
+    if comm_config.trace_buf_size > 0:
         # dump on timeout by default if trace buffer is enabled
         _warn_overwrite_env(DUMP_ON_TIMEOUT, "1")
-        dump_dir = f"{job_config.job.dump_folder}/comm_trace"
+        dump_dir = os.path.join(base_folder, comm_config.save_traces_folder)
         os.makedirs(dump_dir, exist_ok=True)
         _warn_overwrite_env(TRACE_FILE, f"{dump_dir}/rank_")
 
     torch.distributed.init_process_group(
-        backend=_get_distributed_backend(job_config),
-        timeout=timedelta(seconds=job_config.comm.init_timeout_seconds),
+        backend=_get_distributed_backend(enable_cpu_backend),
+        timeout=timedelta(seconds=comm_config.init_timeout_seconds),
     )
 
 
@@ -317,6 +319,7 @@ def clip_grad_norm_(
     error_if_nonfinite: bool = False,
     foreach: bool | None = None,
     pp_mesh: DeviceMesh | None = None,
+    ep_dense_params_mesh_ndim: int | None = None,
 ) -> torch.Tensor:
     """
     Clip the gradient norm of an iterable of parameters.
@@ -338,12 +341,25 @@ def clip_grad_norm_(
             If ``None``, use the foreach implementation for CUDA and CPU native tensors and silently
             fall back to the slow implementation for other device types.
             Default: ``None``
-        pp_mesh: pipeline parallel device mesh. If not None, will reduce gradient norm across PP stages.
+        pp_mesh: Pipeline Parallel device mesh. If not None, will reduce gradient norm across PP stages.
+        ep_dense_params_mesh_ndim: Mesh ndim of the dense params when EP is used. If EP is not used,
+            set it to ``None``.
 
     Returns:
         Total norm of the parameter gradients (viewed as a single vector).
 
     """
+    if ep_dense_params_mesh_ndim is not None:
+        return _clip_grad_norm_with_ep(
+            parameters,
+            max_norm,
+            norm_type,
+            error_if_nonfinite,
+            foreach,
+            pp_mesh,
+            ep_dense_params_mesh_ndim,
+        )
+
     if isinstance(parameters, torch.Tensor):
         parameters = [parameters]
     else:
@@ -363,7 +379,6 @@ def clip_grad_norm_(
     if isinstance(total_norm, DTensor):
         # Will reach here if any non-PP parallelism is used.
         # If only using PP, total_norm will be a local tensor.
-
         total_norm = total_norm.full_tensor()
 
     if pp_mesh is not None:
@@ -375,4 +390,58 @@ def clip_grad_norm_(
             total_norm **= 1.0 / norm_type
 
     torch.nn.utils.clip_grads_with_norm_(parameters, max_norm, total_norm, foreach)
+    return total_norm
+
+
+@torch.no_grad()
+def _clip_grad_norm_with_ep(
+    parameters: torch.Tensor | Iterable[torch.Tensor],
+    max_norm: float,
+    norm_type: float,
+    error_if_nonfinite: bool,
+    foreach: bool | None,
+    pp_mesh: DeviceMesh | None,
+    dense_params_mesh_ndim: int,
+) -> torch.Tensor:
+    ep_params = []
+    non_ep_params = []
+    ep_grads = []
+    non_ep_grads = []
+
+    for p in parameters:
+        if p.grad is None:
+            continue
+        assert isinstance(p, DTensor) and isinstance(p.grad, DTensor)
+        if p.device_mesh.ndim == dense_params_mesh_ndim:
+            non_ep_params.append(p)
+            non_ep_grads.append(p.grad)
+        else:
+            ep_params.append(p)
+            ep_grads.append(p.grad)
+    ep_grads_total_norm = torch.nn.utils.get_total_norm(
+        ep_grads, norm_type, error_if_nonfinite, foreach
+    ).full_tensor()
+    non_ep_grads_total_norm = torch.nn.utils.get_total_norm(
+        non_ep_grads, norm_type, error_if_nonfinite, foreach
+    ).full_tensor()
+
+    if math.isinf(norm_type):
+        total_norm = torch.maximum(ep_grads_total_norm, non_ep_grads_total_norm)
+    else:
+        total_norm = (
+            ep_grads_total_norm**norm_type + non_ep_grads_total_norm**norm_type
+        )
+        total_norm **= 1.0 / norm_type
+
+    if pp_mesh is not None:
+        if math.isinf(norm_type):
+            dist.all_reduce(total_norm, op=dist.ReduceOp.MAX, group=pp_mesh.get_group())
+        else:
+            total_norm **= norm_type
+            dist.all_reduce(total_norm, op=dist.ReduceOp.SUM, group=pp_mesh.get_group())
+            total_norm **= 1.0 / norm_type
+
+    torch.nn.utils.clip_grads_with_norm_(ep_params, max_norm, total_norm, foreach)
+    torch.nn.utils.clip_grads_with_norm_(non_ep_params, max_norm, total_norm, foreach)
+
     return total_norm

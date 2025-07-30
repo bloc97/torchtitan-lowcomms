@@ -8,6 +8,7 @@
 # training techniques (e.g. activation checkpointing and compile) to the Llama model.
 
 from collections import defaultdict
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -27,14 +28,14 @@ from torch.distributed.tensor.parallel import (
     SequenceParallel,
 )
 
-from torchtitan.config_manager import JobConfig, TORCH_DTYPE_MAP
+from torchtitan.config import JobConfig, TORCH_DTYPE_MAP
+from torchtitan.config.job_config import ActivationCheckpoint as ACConfig
 from torchtitan.distributed import ParallelDims
 from torchtitan.tools.logging import logger
 
 
 def parallelize_llama(
     model: nn.Module,
-    world_mesh: DeviceMesh,
     parallel_dims: ParallelDims,
     job_config: JobConfig,
 ):
@@ -45,17 +46,22 @@ def parallelize_llama(
     NOTE: The passed-in model preferably should be on meta device. Otherwise,
     the model must fit on GPU or CPU memory.
     """
-    # TODO: TP currently cannot handle uneven seq_len because we set `use_local_output=True`
-    # (to use plain Tensors), which was because of the bug in computation of complex
-    # numbers with DTensors when setting `use_local_output=False`.
-    # See https://github.com/pytorch/pytorch/issues/130646 and
-    # https://github.com/pytorch/torchtitan/issues/1306 for details.
+    world_mesh = parallel_dims.world_mesh
+    # TODO: TP currently cannot handle uneven seq_len because we set
+    #       `use_local_output=True` to use plain Tensors for legacy reasons.
+    #       Need to revisit this.
     assert (
-        job_config.training.seq_len % (parallel_dims.tp * parallel_dims.cp) == 0
+        job_config.training.seq_len % parallel_dims.seq_len_divisor == 0
     ), f"""
         Sequence length {job_config.training.seq_len} must be divisible by the product of TP degree
-        ({parallel_dims.tp}) and CP degree ({parallel_dims.cp}).
+        ({parallel_dims.tp}) and 2 * CP degree ({parallel_dims.cp}).
         """
+
+    if (
+        job_config.parallelism.context_parallel_degree > 1
+        and model.model_args.use_flex_attn
+    ):
+        raise NotImplementedError("CP support for FlexAttention is still in progress.")
 
     if parallel_dims.tp_enabled:
         if (
@@ -78,7 +84,7 @@ def parallelize_llama(
         apply_tp(
             model,
             world_mesh["tp"],
-            loss_parallel=parallel_dims.loss_parallel_enabled,
+            loss_parallel=not job_config.parallelism.disable_loss_parallel,
             enable_float8_tensorwise_tp=enable_float8_tensorwise_tp,
             enable_async_tp=job_config.parallelism.enable_async_tensor_parallel,
         )
@@ -90,9 +96,8 @@ def parallelize_llama(
     if job_config.training.compile:
         apply_compile(model)
 
-    if (
-        parallel_dims.dp_shard_enabled or parallel_dims.cp_enabled
-    ):  # apply FSDP or HSDP, potentially with Context Parallel
+    if parallel_dims.fsdp_enabled:
+        # apply FSDP or HSDP, potentially with Context Parallel
         if parallel_dims.dp_replicate_enabled:
             dp_mesh_dim_names = ("dp_replicate", "dp_shard_cp")
         else:
@@ -240,7 +245,9 @@ _save_list = {
 }
 
 
-def _apply_ac_to_transformer_block(module: nn.Module, ac_config):
+def _apply_ac_to_transformer_block(
+    module: nn.Module, ac_config: ACConfig, *, base_fqn: Optional[str] = None
+):
     valid_ac_modes = ("full", "selective")
     if ac_config.mode not in valid_ac_modes:
         raise ValueError(
@@ -264,11 +271,35 @@ def _apply_ac_to_transformer_block(module: nn.Module, ac_config):
             create_selective_checkpoint_contexts,
         )
 
+        mm_recompute_shapes = set()
+        if len(ac_config.per_op_sac_force_recompute_mm_shapes_by_fqns) > 0:
+            for module_fqn, submod in module.named_modules():
+                fqn = module_fqn
+                if base_fqn is not None:
+                    fqn = f"{base_fqn}.{module_fqn}"
+                if not any(
+                    filter_fqn in fqn
+                    for filter_fqn in ac_config.per_op_sac_force_recompute_mm_shapes_by_fqns
+                ):
+                    continue
+                if not isinstance(submod, nn.Linear):
+                    raise ValueError(
+                        "per_op_sac_force_recompute_mm_shapes_by_fqns expected to match "
+                        f"a nn.Linear, but got: {submod}"
+                    )
+                out_f, in_f = submod.weight.shape
+                mm_recompute_shapes.add((in_f, out_f))
+            logger.debug(
+                f"Selective op AC force recomputing mms with rhs shapes {mm_recompute_shapes}"
+            )
+
         def _get_custom_policy(meta):
             def _custom_policy(ctx, func, *args, **kwargs):
                 mode = "recompute" if ctx.is_recompute else "forward"
                 mm_count_key = f"{mode}_mm_count"
                 if func == torch.ops.aten.mm.default:
+                    if args[1].shape in mm_recompute_shapes:
+                        return CheckpointPolicy.PREFER_RECOMPUTE
                     meta[mm_count_key] += 1
                 # Saves output of all compute ops, except every second mm
                 to_save = func in _save_list and not (
@@ -302,10 +333,12 @@ def _apply_ac_to_transformer_block(module: nn.Module, ac_config):
             return module
 
 
-def apply_ac(model: nn.Module, ac_config):
+def apply_ac(model: nn.Module, ac_config: ACConfig):
     """Apply activation checkpointing to the model."""
     for layer_id, transformer_block in model.layers.named_children():
-        transformer_block = _apply_ac_to_transformer_block(transformer_block, ac_config)
+        transformer_block = _apply_ac_to_transformer_block(
+            transformer_block, ac_config, base_fqn=f"layers.{layer_id}"
+        )
         model.layers.register_module(layer_id, transformer_block)
 
     logger.info(f"Applied {ac_config.mode} activation checkpointing to the model")
@@ -355,30 +388,41 @@ def apply_fsdp(
     if cpu_offload:
         fsdp_config["offload_policy"] = CPUOffloadPolicy()
 
-    for layer_id, transformer_block in model.layers.items():
-        if reshard_after_forward_policy == "always":
+    match reshard_after_forward_policy:
+        case "always":
             reshard_after_forward = True
-        elif reshard_after_forward_policy == "never":
+        case "never":
             reshard_after_forward = False
-        elif reshard_after_forward_policy == "default":
-            if pp_enabled:
-                # For PP, do not reshard after forward to avoid per-microbatch
-                # all-gathers, which can be expensive and non-overlapped
-                reshard_after_forward = False
-            else:
-                # As an optimization, do not reshard after forward for the last
-                # transformer block since FSDP would prefetch it immediately
-                reshard_after_forward = int(layer_id) < len(model.layers) - 1
-        else:
+        case "default":
+            # For PP, by default do not reshard after forward to avoid per-microbatch
+            # all-gathers, which can be expensive and non-overlapped
+            reshard_after_forward = not pp_enabled
+        case _:
             raise ValueError(
                 f"Invalid reshard_after_forward_policy: {reshard_after_forward_policy}."
             )
+
+    if model.tok_embeddings is not None:
+        fully_shard(
+            model.tok_embeddings,
+            **fsdp_config,
+            reshard_after_forward=reshard_after_forward,
+        )
+    for layer_id, transformer_block in model.layers.items():
         fully_shard(
             transformer_block,
             **fsdp_config,
             reshard_after_forward=reshard_after_forward,
         )
-    fully_shard(model, **fsdp_config, reshard_after_forward=not pp_enabled)
+    # As an optimization, do not reshard_after_forward the last layers by default
+    # since FSDP would prefetch them immediately after the forward pass
+    if model.norm is not None and model.output is not None:
+        fully_shard(
+            [model.norm, model.output],
+            **fsdp_config,
+            reshard_after_forward=reshard_after_forward_policy == "always",
+        )
+    fully_shard(model, **fsdp_config)
     if disable_all_reduce:
         model.set_requires_all_reduce(False, recurse=True)
 
